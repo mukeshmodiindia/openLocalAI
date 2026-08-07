@@ -1,0 +1,10 @@
+config.yaml
+.env
+generated/
+data/
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.DS_Store
+*.log

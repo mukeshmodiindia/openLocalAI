@@ -1,0 +1,261 @@
+# =============================================================================
+# openLocalAI — master configuration
+# Copy this file to config.yaml and fill in your values.
+# Secrets should NOT be hardcoded here — reference them as ${VAR_NAME} and
+# put the actual values in .env (see .env.example). config.py resolves
+# ${VAR_NAME} placeholders against the environment at load time.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Deployment topology — describes the physical/virtual nodes this stack runs
+# on. Add or remove entries under `nodes` freely; `scripts/generate_compose.py`
+# reads this list and:
+#   1. generates one podman-compose file PER NODE, containing only the
+#      services that belong on that node's role(s)
+#   2. generates an nginx load-balancer config that fans out across every
+#      node sharing a role, weighted by each node's declared resources —
+#      so adding a 4th "llm" node automatically gets a share of traffic
+#      proportional to its RAM/CPU, no manual LB config needed.
+#
+# Roles:
+#   llm            -> runs Ollama (model inference)
+#   data           -> runs Qdrant (vector store) + SearxNG (vendor doc search)
+#   orchestration  -> runs the agent service (FastAPI+LangGraph), Open WebUI,
+#                     Slack bot, and the internal store (see below)
+#   lb             -> runs the nginx load balancer (only needed once you have
+#                     more than one node in a given role; omit for single-node)
+#
+# A node can hold more than one role (useful for a small single/2-node setup);
+# for the 3-node layout described in docs/ARCHITECTURE.md, use one role per
+# node as shown below.
+# -----------------------------------------------------------------------------
+deployment:
+  mode: multi_node                     # single_node | multi_node
+  nodes:
+    - name: node1-llm
+      host: 10.0.0.11                  # reachable hostname/IP for this node
+      roles: [llm]
+      resources: { cpu: 32, ram_gb: 32 }
+
+    - name: node2-data
+      host: 10.0.0.12
+      roles: [data]
+      resources: { cpu: 32, ram_gb: 32 }
+
+    - name: node3-orchestration
+      host: 10.0.0.13
+      roles: [orchestration]
+      resources: { cpu: 32, ram_gb: 32 }
+
+    # Example of scaling out: add a 4th node sharing the "llm" role and a
+    # bigger box gets proportionally more traffic automatically once you
+    # rerun scripts/generate_compose.py.
+    # - name: node4-llm-big
+    #   host: 10.0.0.14
+    #   roles: [llm]
+    #   resources: { cpu: 64, ram_gb: 128 }
+
+  load_balancing:
+    enabled: true                      # auto-set true if any role has >1 node
+    strategy: weighted_round_robin     # weighted_round_robin | round_robin | least_conn
+    lb_node: node3-orchestration       # which node runs nginx if no dedicated "lb" role node exists
+    llm_lb_port: 11434
+    orchestration_lb_port: 8000
+
+# -----------------------------------------------------------------------------
+# Internal store — the agent's OWN state: generated plans, Slack
+# approve/reject decisions, run history/audit log. This is separate from the
+# external MySQL/MongoDB/PostgreSQL connectors below, which are data SOURCES
+# the agent reads from, not where the agent stores its own data.
+# -----------------------------------------------------------------------------
+internal_store:
+  provider: postgres                   # postgres (default here — see below) | sqlite (single-node/no-extra-infra option)
+  sqlite_path: /app/data/openlocalai.db   # only used if provider: sqlite
+  # Dedicated Postgres for the agent's OWN state (plans/audit/approvals) —
+  # separate from any Postgres you listed under `databases.postgres` above,
+  # which is an external data source, not the agent's storage. This instance
+  # is deployed for you as part of the "data" role (see generate_compose.py /
+  # podman-compose.single-node.yml) — you don't need to stand it up yourself,
+  # just set credentials in .env.
+  #
+  # IMPORTANT — Podman's bridge network only resolves container names on the
+  # SAME host. Across physical nodes, address the data node by its real
+  # host/IP (matching deployment.nodes[].host for your "data" node), not a
+  # container name:
+  #   - multi_node mode (default below): use the data node's IP, e.g. 10.0.0.12
+  #   - single_node mode: use the container name "store-postgres" instead
+  postgres:
+    host: 10.0.0.12                    # = deployment.nodes[node2-data].host
+    port: 5432
+    user: ${STORE_PG_USER}
+    password: ${STORE_PG_PASSWORD}
+    database: openlocalai
+
+# -----------------------------------------------------------------------------
+# LLM — served via Ollama (running inside Podman, see podman-compose.yml)
+# -----------------------------------------------------------------------------
+llm:
+  provider: ollama                 # ollama | vllm | llamacpp
+  host: http://ollama:11434        # single_node mode: container DNS name works fine.
+                                    # multi_node mode: MUST be the llm node's real host/IP
+                                    # instead (e.g. http://10.0.0.11:11434) — container DNS
+                                    # doesn't resolve across physical hosts on Podman's
+                                    # bridge network. generate_compose.py sets this
+                                    # correctly for you in generated/config notes; if you
+                                    # edit config.yaml by hand, update it to match.
+  model: qwen2.5:14b               # primary model
+  fallback_model: granite3-dense:8b  # used if primary is slow/unavailable, or
+                                    # explicitly selected for RAG-heavy lookups
+  context_window: 32768
+  temperature: 0.2                 # low temp — this is a planning/ops agent, not creative writing
+  request_timeout_seconds: 300     # CPU inference can be slow; keep generous
+
+# -----------------------------------------------------------------------------
+# ServiceNow — source of truth for repeatable change tasks
+# -----------------------------------------------------------------------------
+# TIP: leave enabled: false to deploy the agent first with just the LLM/UI
+# running, then flip to true + fill in details later — no redeploy needed,
+# just POST /admin/reload-config (or restart the agent container) after
+# editing this section.
+servicenow:
+  enabled: false
+  integration_method: rest_table_api   # rest_table_api | scripted_rest
+  instance_url: https://yourinstance.service-now.com
+  auth:
+    type: basic                        # basic | oauth2
+    username: ${SN_USERNAME}
+    password: ${SN_PASSWORD}
+    # --- if auth.type is oauth2, use these instead ---
+    client_id: ${SN_CLIENT_ID}
+    client_secret: ${SN_CLIENT_SECRET}
+    token_url: https://yourinstance.service-now.com/oauth_token.do
+  tables:
+    change_request: change_request
+    incident: incident
+    catalog_task: sc_task
+  # only pull tasks updated in this window when building the RAG cache of
+  # "past similar change tasks"
+  lookback_days: 180
+
+# -----------------------------------------------------------------------------
+# Confluence — internal runbooks / procedural knowledge
+# Same deal: enabled: false is fine at first deploy, turn on when ready.
+# -----------------------------------------------------------------------------
+confluence:
+  enabled: false
+  integration_method: rest_api         # rest_api (Cloud or Data Center)
+  base_url: https://yourcompany.atlassian.net/wiki
+  auth:
+    type: api_token                    # api_token (Cloud) | pat (Data Center) | basic
+    username: ${CONF_USERNAME}
+    api_token: ${CONF_API_TOKEN}
+  spaces:                              # space keys to index for RAG
+    - OPS
+    - DBA
+    - RUNBOOKS
+  reindex_interval_hours: 24
+
+# -----------------------------------------------------------------------------
+# Databases — read-only operational access for things like "current DB size",
+# "list users", etc. Use least-privilege accounts here.
+#
+# You don't have to pre-register a database here at all: POST /db/adhoc-query
+# lets you run a one-off task against a connection you supply in the request,
+# with nothing added to this file. Add an entry below only for DBs you want
+# the agent to be able to query routinely / by name in conversation.
+# -----------------------------------------------------------------------------
+databases:
+  mysql:
+    enabled: false
+    host: db1.internal.example.com
+    port: 3306
+    user: ${MYSQL_USER}
+    password: ${MYSQL_PASSWORD}
+    ssl_mode: preferred
+    readonly: true
+
+  mongodb:
+    enabled: false
+    uri: mongodb://${MONGO_USER}:${MONGO_PASSWORD}@mongo1.internal.example.com:27017/?authSource=admin
+    readonly: true
+
+  postgres:
+    enabled: false
+    host: pg1.internal.example.com
+    port: 5432
+    user: ${PG_USER}
+    password: ${PG_PASSWORD}
+    database: postgres
+    ssl_mode: prefer
+    readonly: true
+
+# -----------------------------------------------------------------------------
+# Live vendor documentation lookup (MySQL/MongoDB/PG official docs) via a
+# self-hosted SearxNG instance, scoped to an allow-list of trusted domains.
+# Safe to leave enabled from the start — it's read-only, external doc search.
+# -----------------------------------------------------------------------------
+web_lookup:
+  enabled: true
+  integration_method: searxng
+  searxng_url: http://searxng:8080
+  allowed_domains:
+    - dev.mysql.com
+    - www.mongodb.com
+    - docs.mongodb.com
+    - www.postgresql.org
+  max_results_per_query: 5
+
+# -----------------------------------------------------------------------------
+# Vector store (RAG index over Confluence pages + cached vendor docs)
+# Always needed — this is core infra, not an optional integration.
+# -----------------------------------------------------------------------------
+vector_store:
+  provider: qdrant
+  host: http://qdrant:6333
+  collection: opslocal_knowledge
+  embedding_model: nomic-embed-text     # pulled via ollama, runs locally
+
+# -----------------------------------------------------------------------------
+# Slack — notifications and approval workflow
+# -----------------------------------------------------------------------------
+slack:
+  enabled: false
+  integration_method: socket_mode        # socket_mode (no public webhook needed) | events_api
+  bot_token: ${SLACK_BOT_TOKEN}
+  app_token: ${SLACK_APP_TOKEN}          # required for socket_mode
+  default_channel: "#change-tasks"
+  post_plan_for_approval: true
+
+# -----------------------------------------------------------------------------
+# Podman / runtime
+# -----------------------------------------------------------------------------
+podman:
+  network_name: openlocalai_net
+  pod_name: openlocalai_pod
+  volumes:
+    models: openlocalai_models
+    qdrant_data: openlocalai_qdrant_data
+    searxng_data: openlocalai_searxng_data
+  # Per-container caps, applied on whichever node each service lands on
+  # (see deployment.nodes above for WHICH node runs WHAT). These are
+  # ceilings, not the load-balancing weights — LB weighting is derived
+  # automatically from deployment.nodes[].resources.
+  resource_limits:
+    ollama:
+      memory: 24g
+      cpus: "16"
+    agent:
+      memory: 4g
+      cpus: "4"
+    qdrant:
+      memory: 2g
+      cpus: "2"
+
+# -----------------------------------------------------------------------------
+# Agent service
+# -----------------------------------------------------------------------------
+agent:
+  host: 0.0.0.0
+  port: 8000
+  log_level: INFO
+  max_concurrent_tasks: 3
