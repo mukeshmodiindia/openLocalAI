@@ -21,6 +21,15 @@ services:
     image: docker.io/ollama/ollama:latest
     container_name: ollama
     networks: [openlocalai_net]
+    environment:
+      # Prevents multiple models being loaded/inferencing concurrently on
+      # CPU-only single-node hosts, which was found to saturate all cores
+      # and severely degrade response latency (two 100%-CPU llama-server
+      # processes fighting for the same cores). See docs/ARCHITECTURE.md
+      # and the error/solution table in the deployment guide.
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_KEEP_ALIVE=2m
     volumes:
       - openlocalai_models:/root/.ollama
     ports:
