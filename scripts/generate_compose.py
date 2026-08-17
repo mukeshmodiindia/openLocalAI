@@ -43,6 +43,14 @@ BASE_SERVICE_DEFS = {
     image: docker.io/ollama/ollama:latest
     container_name: ollama
     networks: [openlocalai_net]
+    environment:
+      # Keep only one model loaded/generating at a time. On CPU-only nodes,
+      # letting Ollama run multiple models concurrently (e.g. after switching
+      # models in the UI) was found to saturate all cores at once and cause
+      # severe latency. See README.md Troubleshooting section.
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_KEEP_ALIVE=2m
     volumes:
       - openlocalai_models:/root/.ollama
     ports:
