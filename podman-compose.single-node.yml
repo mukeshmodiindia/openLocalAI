@@ -85,7 +85,7 @@ services:
     restart: unless-stopped
 
   webui:
-    image: docker.io/ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:main
     container_name: openlocalai_webui
     networks: [openlocalai_net]
     environment:
